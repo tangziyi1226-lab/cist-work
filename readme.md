@@ -24,7 +24,6 @@ Llama-3.1-8B-Instruct + SnapKV + LongBench 子集
 
 ## 3. 参考材料
 
-- 论文：`example_paper.pdf`
 - 论文链接：`https://openreview.net/forum?id=xhAMjsnWUe`
 - 可参考公开基线仓库(**建议基于该仓库进行实现**)：`https://github.com/FFY0/AdaKV.git`
 - LongBench数据集地址：`https://huggingface.co/datasets/zai-org/LongBench`
