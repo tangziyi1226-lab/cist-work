@@ -1,1 +1,8 @@
 .DS_Store
+.env
+data/
+models/
+outputs/*
+!outputs/.gitkeep
+*.pyc
+__pycache__/

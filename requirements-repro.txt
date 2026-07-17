@@ -1,0 +1,15 @@
+# AdaKV pins transformers 4.44.2. Install torch using the wheel matching the
+# CUDA version on the experiment server before installing this file.
+transformers==4.44.2
+datasets>=2.19,<3
+huggingface-hub>=0.24
+accelerate>=0.33
+tiktoken
+jieba
+rouge-score
+matplotlib
+seaborn
+pandas
+
+# flash-attn==2.4.0 is intentionally omitted here: install it separately on
+# the CUDA host, because it compiles against the installed torch/CUDA stack.
