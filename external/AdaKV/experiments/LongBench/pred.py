@@ -249,12 +249,22 @@ if __name__ == '__main__':
                 if hasattr(layer.self_attn, "kv_cluster"):
                     layer.self_attn.kv_cluster.budget_log_path = task_budget_log
         if args.e:
-            data = load_dataset(args.dataset, f"{dataset}_e", split='test')
+            data = load_dataset(
+                args.dataset,
+                f"{dataset}_e",
+                split='test',
+                trust_remote_code=True,
+            )
             if not os.path.exists(f"pred_e/{args.out_name}"):
                 os.makedirs(f"pred_e/{args.out_name}")
             out_path = f"pred_e/{args.out_name}/{dataset}.jsonl"
         else:
-            data = load_dataset(args.dataset, f"{dataset}", split='test')
+            data = load_dataset(
+                args.dataset,
+                f"{dataset}",
+                split='test',
+                trust_remote_code=True,
+            )
             if not os.path.exists(f"pred/{args.out_name}"):
                 os.makedirs(f"pred/{args.out_name}")
             out_path = f"pred/{args.out_name}/{dataset}.jsonl"

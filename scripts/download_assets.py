@@ -30,7 +30,13 @@ def main():
 
         for task in TASKS:
             print(f"Caching LongBench task: {task}")
-            load_dataset("zai-org/LongBench", task, split="test", token=token)
+            load_dataset(
+                "zai-org/LongBench",
+                task,
+                split="test",
+                token=token,
+                trust_remote_code=True,
+            )
 
     if not args.data_only:
         if not token:
