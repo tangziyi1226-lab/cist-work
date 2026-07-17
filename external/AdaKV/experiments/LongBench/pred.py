@@ -20,6 +20,8 @@ def parse_args(args=None):
     parser.add_argument('--max_length', type=int, required=True)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
     parser.add_argument("-d", '--dataset', type=str, default="zai-org/LongBench")
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help="Local LongBench directory containing data/*.jsonl and data_e/*.jsonl")
     parser.add_argument("--out_name", type=str, required=True)
     parser.add_argument('--compress_args_path', type=str, default=None, help="Path to the compress args")
     # parser.add_argument('--adaptive', action='store_true', help="Use adaptive budgets allocation across heads")
@@ -39,6 +41,23 @@ def parse_args(args=None):
     parser.add_argument('--tasks', nargs='+', default=None)
     parser.add_argument('--max_samples', type=int, default=None)
     return parser.parse_args(args)
+
+
+def load_longbench_task(args, dataset):
+    if args.data_dir:
+        split_dir = "data_e" if args.e else "data"
+        data_file = os.path.join(args.data_dir, split_dir, f"{dataset}.jsonl")
+        if not os.path.isfile(data_file):
+            raise FileNotFoundError(f"LongBench task file not found: {data_file}")
+        return load_dataset("json", data_files=data_file, split="train")
+
+    config_name = f"{dataset}_e" if args.e else dataset
+    return load_dataset(
+        args.dataset,
+        config_name,
+        split="test",
+        trust_remote_code=True,
+    )
 
 # This is the customized building prompt for chat models
 def build_chat(tokenizer, prompt, model_name):
@@ -249,22 +268,12 @@ if __name__ == '__main__':
                 if hasattr(layer.self_attn, "kv_cluster"):
                     layer.self_attn.kv_cluster.budget_log_path = task_budget_log
         if args.e:
-            data = load_dataset(
-                args.dataset,
-                f"{dataset}_e",
-                split='test',
-                trust_remote_code=True,
-            )
+            data = load_longbench_task(args, dataset)
             if not os.path.exists(f"pred_e/{args.out_name}"):
                 os.makedirs(f"pred_e/{args.out_name}")
             out_path = f"pred_e/{args.out_name}/{dataset}.jsonl"
         else:
-            data = load_dataset(
-                args.dataset,
-                f"{dataset}",
-                split='test',
-                trust_remote_code=True,
-            )
+            data = load_longbench_task(args, dataset)
             if not os.path.exists(f"pred/{args.out_name}"):
                 os.makedirs(f"pred/{args.out_name}")
             out_path = f"pred/{args.out_name}/{dataset}.jsonl"

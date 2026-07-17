@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT="${PROJECT:-/root/autodl-tmp/cist-work}"
 PYTHON_BIN="${PYTHON_BIN:-/root/autodl-tmp/envs/entrokv/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/root/autodl-fs/models/Llama-3.1-8B-Instruct}"
+DATA_DIR="${DATA_DIR:-/root/autodl-fs/longbench}"
 MAX_SAMPLES="${MAX_SAMPLES:-20}"
 MAX_LENGTH="${MAX_LENGTH:-16384}"
 BUDGET_RATIO="${BUDGET_RATIO:-0.30}"
@@ -29,6 +30,7 @@ run_mode() {
 
   "$PYTHON_BIN" pred.py \
     --model_name_or_path "$MODEL_PATH" \
+    --data_dir "$DATA_DIR" \
     --max_length "$MAX_LENGTH" \
     --mode "$mode" \
     --out_name "$name" \

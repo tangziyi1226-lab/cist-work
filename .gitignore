@@ -8,3 +8,5 @@ outputs/*
 __pycache__/
 setup.log
 flash_build.log
+data_download.log
+data_zip_download.log
