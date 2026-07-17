@@ -1,5 +1,7 @@
 import importlib
+import json
 import sys
+import tempfile
 import types
 import unittest
 
@@ -59,6 +61,24 @@ class EntroKVAllocationTest(unittest.TestCase):
         cluster.budget_ratio = 0.3
         cluster._set_ratio_capacity(4096)
         self.assertEqual(cluster.base_capacity + cluster.window_size, round(4096 * 0.3))
+
+    def test_full_gqa_compression_path_has_expected_flattened_length(self):
+        cluster = self.make_cluster()
+        cluster.budget_ratio = 0.3
+        query = torch.randn(1, 32, 128, 16)
+        key = torch.randn(1, 8, 128, 16)
+        value = torch.randn(1, 8, 128, 16)
+        with tempfile.NamedTemporaryFile(suffix=".jsonl") as log:
+            cluster.budget_log_path = log.name
+            compressed_key, compressed_value = cluster.update_kv_gqa(key, query, value)
+            with open(log.name, encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle]
+
+        expected_per_head = round(128 * 0.3)
+        self.assertEqual(compressed_key.shape, (8 * expected_per_head, 16))
+        self.assertEqual(compressed_value.shape, compressed_key.shape)
+        self.assertEqual(int(cluster.head_lens.sum()), 8 * expected_per_head)
+        self.assertEqual(records[0]["total_budget"], 8 * expected_per_head)
 
 
 if __name__ == "__main__":
