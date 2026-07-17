@@ -1,6 +1,0 @@
-[submodule "external/AdaKV"]
-	path = external/AdaKV
-	url = https://github.com/FFY0/AdaKV.git
-[submodule "external/LongBench"]
-	path = external/LongBench
-	url = https://github.com/THUDM/LongBench.git
