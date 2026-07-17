@@ -6,3 +6,5 @@ outputs/*
 !outputs/.gitkeep
 *.pyc
 __pycache__/
+setup.log
+flash_build.log

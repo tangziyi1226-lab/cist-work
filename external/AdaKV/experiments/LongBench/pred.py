@@ -19,11 +19,11 @@ def parse_args(args=None):
     parser.add_argument("-m", '--model_name_or_path', type=str, required=True)
     parser.add_argument('--max_length', type=int, required=True)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
-    parser.add_argument("-d", '--dataset', type=str, default="THUDM/LongBench")
+    parser.add_argument("-d", '--dataset', type=str, default="zai-org/LongBench")
     parser.add_argument("--out_name", type=str, required=True)
     parser.add_argument('--compress_args_path', type=str, default=None, help="Path to the compress args")
     # parser.add_argument('--adaptive', action='store_true', help="Use adaptive budgets allocation across heads")
-    parser.add_argument('--mode', type=str, choices=['ada', 'fix', 'test', "slm"], help="Ada mode, fix mode or normal")
+    parser.add_argument('--mode', type=str, choices=['ada', 'entro', 'fix', 'test', "slm"], help="Compression mode")
     parser.add_argument('--floor_alpha',type=float,default=0.2,help="floor_alpha budgets for each head")
     parser.add_argument('--gqa_support',action='store_true', default=False, help="init gqa_support")
     parser.add_argument('--gqa_func',type=str, default="mean", help="gqa operation:optional max mean")
@@ -33,6 +33,11 @@ def parse_args(args=None):
     parser.add_argument('--budget',default=1024, type=int, help="budget size for kv cache")
 
     parser.add_argument('--budget_ratio',type=float,default=0.2,help="floor_alpha budgets for each head")
+    parser.add_argument('--entropy_alpha', type=float, default=0.5)
+    parser.add_argument('--entropy_baseline', type=float, default=0.3)
+    parser.add_argument('--budget_log_path', type=str, default=None)
+    parser.add_argument('--tasks', nargs='+', default=None)
+    parser.add_argument('--max_samples', type=int, default=None)
     return parser.parse_args(args)
 
 # This is the customized building prompt for chat models
@@ -98,6 +103,7 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
                 input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
             context_length = input.input_ids.shape[-1]
 
+            torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
             t = time.time()
             if dataset == "samsum": # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
@@ -126,9 +132,12 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
             pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
             pred = post_process(pred, model_name_or_path)
             preds.append(pred)
+            output_tokens = int(output.shape[-1] - context_length)
+            peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            tokens_per_second = output_tokens / t if t > 0 else 0.0
 
 
-            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "time": t}, f, ensure_ascii=False )
+            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "latency_s": t, "input_tokens": context_length, "output_tokens": output_tokens, "tokens_per_second": tokens_per_second, "peak_memory_mb": peak_memory_mb}, f, ensure_ascii=False )
             f.write('\n')
             f.flush()
 
@@ -137,10 +146,7 @@ def get_pred(model, tokenizer, data, max_length, max_gen, prompt_format, dataset
             torch.cuda.empty_cache()
 
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        for json_obj, pred, t in zip(data, preds, times):
-            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"], "time": t}, f, ensure_ascii=False )
-            f.write('\n')
+    os.replace(f"{out_path}_tmp", out_path)
 
 
 def seed_everything(seed):
@@ -208,6 +214,9 @@ if __name__ == '__main__':
         print("Ada mode")
         replace_mistral_adaptive()
         replace_llama_adaptive()
+    elif args.mode == "entro":
+        print("EntroKV mode")
+        replace_llama_adaptive()
     elif args.mode == "fix":
         print("Fix mode")
         replace_mistral_fixed()
@@ -223,16 +232,29 @@ if __name__ == '__main__':
     # NOTE: load model after replace
     model, tokenizer = load_model_and_tokenizer(model_name_or_path)
 
-    config_compress(model, base_capacity=args.budget, pyram_mode=args.pyram, floor_alpha=args.floor_alpha, gqa_support=args.gqa_support, gqa_func=args.gqa_func)
+    config_compress(model, base_capacity=args.budget, pyram_mode=args.pyram, floor_alpha=args.floor_alpha,
+                    gqa_support=args.gqa_support, gqa_func=args.gqa_func,
+                    allocation_mode="entropy" if args.mode == "entro" else "ada",
+                    entropy_alpha=args.entropy_alpha, entropy_baseline=args.entropy_baseline,
+                    budget_log_path=args.budget_log_path, budget_ratio=args.budget_ratio)
+
+    if args.tasks:
+        datasets = args.tasks
 
     for dataset in datasets:
+        if args.budget_log_path:
+            task_budget_log = args.budget_log_path.format(dataset=dataset)
+            model.model.config.budget_log_path = task_budget_log
+            for layer in model.model.layers:
+                if hasattr(layer.self_attn, "kv_cluster"):
+                    layer.self_attn.kv_cluster.budget_log_path = task_budget_log
         if args.e:
-            data = load_dataset(args.dataset, f"{dataset}_e", split='test', data_dir=f"{args.dataset}/data")
+            data = load_dataset(args.dataset, f"{dataset}_e", split='test')
             if not os.path.exists(f"pred_e/{args.out_name}"):
                 os.makedirs(f"pred_e/{args.out_name}")
             out_path = f"pred_e/{args.out_name}/{dataset}.jsonl"
         else:
-            data = load_dataset(args.dataset, f"{dataset}", split='test', data_dir=f"{args.dataset}/data")
+            data = load_dataset(args.dataset, f"{dataset}", split='test')
             if not os.path.exists(f"pred/{args.out_name}"):
                 os.makedirs(f"pred/{args.out_name}")
             out_path = f"pred/{args.out_name}/{dataset}.jsonl"
@@ -244,6 +266,8 @@ if __name__ == '__main__':
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
+        if args.max_samples is not None:
+            data_all = data_all[:args.max_samples]
         # TODO: hard code single process, which use all gpus
         torch.cuda.synchronize()
         t = time.time()

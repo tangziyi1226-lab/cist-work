@@ -31,7 +31,7 @@ def check_version():
 
 
 # config hyperparameters
-def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, pooling="maxpool", floor_alpha=0.5, pyram_mode = False, beta = 20, skip=0, gqa_support=False,gqa_func="mean"):
+def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, pooling="maxpool", floor_alpha=0.5, pyram_mode = False, beta = 20, skip=0, gqa_support=False,gqa_func="mean", allocation_mode="ada", entropy_alpha=0.5, entropy_baseline=0.3, budget_log_path=None, budget_ratio=None):
     model.model.config.window_size = window_size
     model.model.config.base_capacity = base_capacity
     model.model.config.kernel_size = kernel_size
@@ -46,6 +46,11 @@ def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, po
 
     model.model.config.gqa_support = gqa_support
     model.model.config.gqa_func = gqa_func
+    model.model.config.allocation_mode = allocation_mode
+    model.model.config.entropy_alpha = entropy_alpha
+    model.model.config.entropy_baseline = entropy_baseline
+    model.model.config.budget_log_path = budget_log_path
+    model.model.config.budget_ratio = budget_ratio
 
     return model
 
@@ -86,4 +91,3 @@ def replace_mistral_slm():
     transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = fixed_prepare_inputs_for_generation_mistral
     transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = slm_mistral_flash_attn2_forward
     transformers.models.mistral.modeling_mistral.MistralModel.forward = slm_MistralModel_forward
-

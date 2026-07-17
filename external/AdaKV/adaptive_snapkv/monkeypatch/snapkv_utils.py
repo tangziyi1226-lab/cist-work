@@ -1,4 +1,6 @@
 import warnings
+import json
+import os
 
 import torch
 import time
@@ -179,7 +181,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class SnapKVCluster():
-    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None):
+    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None, budget_ratio=None):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -196,6 +198,7 @@ class SnapKVCluster():
         self.gqa_support = gqa_support
         self.num_key_value_groups = num_key_value_groups
         self.gqa_func = gqa_func
+        self.budget_ratio = budget_ratio
         if self.gqa_support:
             assert gqa_func is not None, "gqa_func should not be None"
             assert gqa_func in ['max','mean'], "currently gqa_func should be in ['max','mean']"
@@ -219,6 +222,8 @@ class SnapKVCluster():
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
+        if self.budget_ratio is not None:
+            self.max_capacity_prompt = max(self.window_size + 1, int(round(q_len * self.budget_ratio)))
 
         # compute pyramidal capacity
         if self.pyram_mode and not self.pyram_init:
@@ -296,7 +301,8 @@ class SnapKVCluster():
 
 class AdaptiveSnapKVCluster():
     def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',base_capacity=None,floor_alpha = None,skip = None,normalize=None, 
-                 layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None):
+                 layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None,
+                 allocation_mode="ada", entropy_alpha=0.5, entropy_baseline=0.3, budget_log_path=None, budget_ratio=None):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -312,6 +318,12 @@ class AdaptiveSnapKVCluster():
         self.pyram_beta = pyram_beta
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
+        self.allocation_mode = allocation_mode
+        self.entropy_alpha = entropy_alpha
+        self.entropy_baseline = entropy_baseline
+        self.budget_log_path = budget_log_path
+        self.last_entropy = None
+        self.budget_ratio = budget_ratio
 
         # NOTE: layer-wise meta-data
         self.head_lens = None
@@ -345,7 +357,19 @@ class AdaptiveSnapKVCluster():
 
         attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        history_attention = attn_weights[:, :, -self.window_size:, : -self.window_size]
+        history_attention = history_attention / history_attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        entropy = -(history_attention * history_attention.clamp_min(1e-12).log()).sum(dim=-1).mean(dim=-1)
+        entropy = entropy / math.log(max(history_attention.shape[-1], 2))
+        if self.gqa_support:
+            entropy = entropy.view(entropy.shape[0], num_heads // self.num_key_value_groups, self.num_key_value_groups)
+            if self.gqa_func == 'max':
+                entropy = entropy.max(dim=-1).values
+            else:
+                entropy = entropy.mean(dim=-1)
+        self.last_entropy = entropy.clamp(0, 1)
+        attn_weights = attn_weights.to(query_states.dtype)
         attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
 
         if self.gqa_support:
@@ -368,6 +392,46 @@ class AdaptiveSnapKVCluster():
         else:
             raise ValueError('Pooling method not supported')
         return attn_weights_mean_pooling
+
+    def _entropy_capacities(self, candidate_length):
+        """Allocate the fixed SnapKV total with EntroKV's entropy rule."""
+        entropy = self.last_entropy.float()
+        raw = (1.0 - self.entropy_alpha) * self.entropy_baseline + self.entropy_alpha * entropy
+        target_total = raw.shape[-1] * self.base_capacity
+        quota = raw / raw.sum(dim=-1, keepdim=True).clamp_min(1e-12) * target_total
+        capacity = torch.floor(quota).to(torch.int64).clamp(min=0, max=candidate_length)
+
+        # Largest-remainder apportionment with an exact per-layer total.
+        for batch_idx in range(capacity.shape[0]):
+            remainder = int(target_total - capacity[batch_idx].sum().item())
+            while remainder > 0:
+                eligible = capacity[batch_idx] < candidate_length
+                if not eligible.any():
+                    break
+                score = (quota[batch_idx] - capacity[batch_idx].float()).masked_fill(~eligible, -float("inf"))
+                head_idx = int(score.argmax().item())
+                capacity[batch_idx, head_idx] += 1
+                remainder -= 1
+
+        assert capacity.sum(dim=-1).eq(target_total).all(), "EntroKV budget conservation failed"
+        self._log_entropy_budget(entropy, capacity)
+        return capacity
+
+    def _log_entropy_budget(self, entropy, capacity):
+        if not self.budget_log_path:
+            return
+        log_dir = os.path.dirname(self.budget_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "layer": self.layer_idx,
+            "entropy": entropy[0].detach().cpu().tolist(),
+            "history_budget": capacity[0].detach().cpu().tolist(),
+            "window_size": self.window_size,
+            "total_budget": int(capacity[0].sum().item() + capacity.shape[-1] * self.window_size),
+        }
+        with open(self.budget_log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     
     def update_kv(self, origin_key_states, query_states, origin_value_states):
         if self.gqa_support:
@@ -384,6 +448,7 @@ class AdaptiveSnapKVCluster():
         # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
         _device = key_states.device
         bsz, num_heads, q_len, head_dim = query_states.shape
+        self._set_ratio_capacity(q_len)
         attn_score= self.calcul_attn_sore(key_states,query_states)
         origin_heads_key_states = torch.split(origin_key_states, 1, dim=1)
         origin_heads_value_states = torch.split(origin_value_states, 1, dim=1)
@@ -443,7 +508,9 @@ class AdaptiveSnapKVCluster():
 
 
         sorted_attn_score,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
-        if self.layer_idx >= self.skip:
+        if self.allocation_mode == "entropy":
+            head_adaptive_capacity = self._entropy_capacities(attn_score.size(-1))
+        elif self.layer_idx >= self.skip:
             adaptive_attn_score = sorted_attn_score
             length = adaptive_attn_score.size(dim=-1)
             if self.normalize:
@@ -511,6 +578,7 @@ class AdaptiveSnapKVCluster():
         # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
         _device = key_states.device
         bsz, num_heads, q_len, head_dim = query_states.shape
+        self._set_ratio_capacity(q_len)
         attn_score= self.calcul_attn_sore(key_states,query_states)
         origin_heads_key_states = torch.split(key_states, 1, dim=1)
         origin_heads_value_states = torch.split(value_states, 1, dim=1)
@@ -562,7 +630,9 @@ class AdaptiveSnapKVCluster():
         # if you need to weight the attn_score
         pass
         sorted_attn_score,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
-        if self.layer_idx >= self.skip:
+        if self.allocation_mode == "entropy":
+            head_adaptive_capacity = self._entropy_capacities(attn_score.size(-1))
+        elif self.layer_idx >= self.skip:
             adaptive_attn_score = sorted_attn_score
             length = adaptive_attn_score.size(dim=-1)
             if self.normalize:
@@ -618,6 +688,14 @@ class AdaptiveSnapKVCluster():
 
         return heads_key_states,heads_value_states
 
+    def _set_ratio_capacity(self, q_len):
+        if self.budget_ratio is None:
+            return
+        total_capacity = max(self.window_size + 1, int(round(q_len * self.budget_ratio)))
+        self.base_capacity = total_capacity - self.window_size
+        self.floor_capacity = int(self.base_capacity * self.floor_ratio)
+        self.adaptive_capacity = self.base_capacity - self.floor_capacity
+
 
 def init_snapkv(self):
 
@@ -638,7 +716,8 @@ def init_snapkv(self):
             pyram_beta = self.config.pyram_beta,
             gqa_support = self.config.gqa_support,
             num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads,
-            gqa_func = self.config.gqa_func
+            gqa_func = self.config.gqa_func,
+            budget_ratio = getattr(self.config, "budget_ratio", None)
             )
         if self.config.gqa_support:
             if self.config.model_type != "mistral":
@@ -672,12 +751,17 @@ def init_adaptive_snapkv(self):
             pyram_beta = self.config.pyram_beta,
             gqa_support = self.config.gqa_support,
             num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads,
-            gqa_func = self.config.gqa_func
+            gqa_func = self.config.gqa_func,
+            allocation_mode = getattr(self.config, "allocation_mode", "ada"),
+            entropy_alpha = getattr(self.config, "entropy_alpha", 0.5),
+            entropy_baseline = getattr(self.config, "entropy_baseline", 0.3),
+            budget_log_path = getattr(self.config, "budget_log_path", None),
+            budget_ratio = getattr(self.config, "budget_ratio", None)
             )
         if self.config.gqa_support:
             if self.config.model_type != "mistral":
                 warnings.warn("GQA currently supports only for mistral-7B-v0.2 model")
-        print(f"Compress config(Ada): window_size={self.kv_cluster.window_size}, base_capacity={self.kv_cluster.base_capacity}, kernel_size={self.kv_cluster.kernel_size}, pooling={self.kv_cluster.pooling}, floor_alpha={self.kv_cluster.floor_ratio}, pyram_mode={self.kv_cluster.pyram_mode}, beta={self.kv_cluster.pyram_beta}", flush=True)
+        print(f"Compress config({self.kv_cluster.allocation_mode}): window_size={self.kv_cluster.window_size}, base_capacity={self.kv_cluster.base_capacity}, kernel_size={self.kv_cluster.kernel_size}, pooling={self.kv_cluster.pooling}, floor_alpha={self.kv_cluster.floor_ratio}, pyram_mode={self.kv_cluster.pyram_mode}, beta={self.kv_cluster.pyram_beta}", flush=True)
 
 
 
@@ -715,8 +799,3 @@ def init_slm(self,**kwargs):
             max_capacity_prompt = self.config.base_capacity,
             )
         print(f"Compress config(SLM): max_cap={self.config.base_capacity}")
-
-
-
-
-

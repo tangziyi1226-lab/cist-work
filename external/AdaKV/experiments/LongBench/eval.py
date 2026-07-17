@@ -65,6 +65,8 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument('--allow_partial', action='store_true', help="Score partial debug/evaluation runs")
+    parser.add_argument('--models', nargs='+', default=None, help="Only evaluate these prediction folders")
     return parser.parse_args(args)
 
 def scorer_e(dataset, predictions, answers, lengths, all_classes):
@@ -101,7 +103,8 @@ def scorer(dataset, predictions, answers, all_classes):
 if __name__ == '__main__':
     args = parse_args()
 
-    for model in os.listdir("pred/"):
+    models = args.models or os.listdir("pred/")
+    for model in models:
         scores = dict()
         scores_list = dict()
         args.model = model
@@ -128,7 +131,7 @@ if __name__ == '__main__':
                         lengths.append(data["length"])
                 dataset_name = filename.split('.')[0]
                 target_samples = dataset_samples.get(dataset_name, 200)
-                if line_cnt != target_samples:
+                if line_cnt != target_samples and not args.allow_partial:
                     print(f"Error: {dataset_name} has {line_cnt} samples, expected {target_samples}")
                     continue
             if args.e:
